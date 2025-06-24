@@ -30,24 +30,24 @@ def hsv_to_rgb(h, s, v):
         return v, p, q
 
 
-class ExampleApp(app.App):
+class MicApp(app.App):
     def __init__(self, config=None):
-        eventbus.emit(PatternDisable())
+        
+        eventbus.emit(PatternDisable()) # disable the ambient pattern. 
+        self.hexpansion_config = HexpansionConfig(2) # set the hexpansion socket.
 
-        self.hexpansion_config = HexpansionConfig(2)
+        self.volume = 0.0 # current absolute volume
+        self.rmin = 1.0 # rolling minimum
+        self.rmax = 10.0 # rolling maximum
+        self.relative = 0.1 # relative volume
+        self.vl_decay = 0.99 # volume limit decay
 
-        self.volume = 0
-        self.rmin = 1.0
-        self.rmax = 100.0
-        self.relative = 0
-
-        self.alpha = 0.99
         self.buffer = bytearray(1024)
 
-        self.led_levels = [0] * 12      # Current level for each LED
-        self.peak_levels = [0] * 12     # Peak/trail levels
-        self.decay_rate = 100             # Amount of decay per frame (tweak)
+        self.led_levels = [0.0] * 12  # Current level for each LED
+        self.led_decay = .4 # led decay factor
 
+        # set up the microphone
         self.i2s = I2S(
             0,
             sck=self.hexpansion_config.pin[0],
@@ -62,9 +62,11 @@ class ExampleApp(app.App):
 
         # Order of LEDs from bottom -> top
         self.led_order = [6, 7, 5, 8, 4, 9, 3, 10, 2, 11, 1, 12]
+        self.hue = 0.0
+        self.brightness_control = 0.5
 
     def get_volume(self):
-        """Calculate RMS volume and maintain rolling range."""
+        # Calculate RMS volume and maintain rolling range
         self.i2s.readinto(self.buffer)
 
         total = 0
@@ -78,50 +80,58 @@ class ExampleApp(app.App):
         if self.volume < self.rmin:
             self.rmin = self.volume
         else:
-            self.rmin = self.rmin / self.alpha
+            self.rmin = self.rmin / self.vl_decay
         if self.volume > self.rmax:
             self.rmax = self.volume
         else:
-            self.rmax = self.rmax * self.alpha
+            self.rmax = self.rmax * self.vl_decay
 
         # Get relative position
         self.relative = (self.volume - self.rmin) / (self.rmax - self.rmin) if (self.rmax - self.rmin) > 0 else 0
-        self.relative = max(min(self.relative, 1), 0)
+        self.relative = math.pow(max(min(self.relative, 1), 0),2)
+        
+    def paint_leds(self):
+        
+        total_brightness = 12.0 * self.relative
+        
+        for i, led in enumerate(self.led_order):
+            if total_brightness >= 1:
+                led_brightness = 1
+                total_brightness-=1
+            else:
+                led_brightness = total_brightness
+                total_brightness = 0
+            #print(self.led_levels[i],led_brightness)
+            self.led_levels[i] = max(self.led_levels[i],led_brightness) # set high water mark
+            
+            r,g,b = hsv_to_rgb(self.hue + (i * 0.02), 1.0, self.led_levels[i] * self.brightness_control)
+            
+            #tildagonos.leds[led] = (0,int(self.led_levels[i]*255), int(self.led_levels[i]*255)) # paint leds
+            tildagonos.leds[led] = (r, g, b) # paint leds
+            
+            self.led_levels[i] = max(self.led_levels[i] - self.led_decay, 0) # decay high water mark
+            
+        tildagonos.leds.write()
+        
+        self.hue += 0.01
+        if self.hue >= 1.0:
+            self.hue-= 1.0
+            
+            
 
     def update(self, delta):
         """Update LEDs with gradual lighting and trailing effect."""
         self.get_volume()
 
-        num_leds = int(math.pow(self.relative, 2) * 12)
+        self.paint_leds()
+            
 
-        # Update led_levels
-        for idx, led in enumerate(self.led_order):
-            target_level = 255 if idx < num_leds else 0
-            # Smooth the level (instant rise, quick fall), you can tweak this
-            self.led_levels[idx] = target_level if target_level > self.led_levels[idx] else max(self.led_levels[idx] - self.decay_rate, 0)
-
-            # Maintain peak_levels
-            if self.led_levels[idx] > self.peak_levels[idx]:
-                self.peak_levels[idx] = self.led_levels[idx]
-            else:
-                self.peak_levels[idx] = max(self.peak_levels[idx] - self.decay_rate // 2, 0)
-
-        # Push to LEDs
-        for idx, led in enumerate(self.led_order):
-            live_level = self.led_levels[idx]
-            trail_level = self.peak_levels[idx]
-            brightness = max(live_level, trail_level)
-            r, g, b = hsv_to_rgb(0.5,1,brightness // 5)
-
-            # Set LED color (teal shade for example), scaled by brightness
-            tildagonos.leds[led] = (0,brightness // 5, brightness // 5)
-
-        tildagonos.leds.write()
+        
 
     def draw(self, ctx):
         """Clear screen each frame."""
         clear_background(ctx)
 
 
-__app_export__ = ExampleApp
+__app_export__ = MicApp
 
