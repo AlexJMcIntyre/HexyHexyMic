@@ -1,1 +1,1 @@
-python -m mpremote mount modules + run badge-2024-software/modules/scripts/mount_hexpansions.py + cp micapp/app.py :/hexpansion_1/app.py
+python -m mpremote mount modules + run badge-2024-software/modules/scripts/mount_hexpansions.py + cp z:/Projects/EMF/HexyMic/app/app.py :/hexpansion_2/app.py
