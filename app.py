@@ -1,6 +1,7 @@
 import app
 import struct
 import math
+import time
 from machine import Pin, I2S, I2C
 from app_components import clear_background, Menu, Notification
 from system.eventbus import eventbus
@@ -32,7 +33,8 @@ def hsv_to_rgb(h, s, v):
 menu_items = [
     "HexyHexyMic!",
     "Vis Mode",
-    "Color Palette"]
+    "Color Palette",
+    "Brightness"]
 
 class MicApp(app.App):
     def __init__(self, config=None):
@@ -40,16 +42,17 @@ class MicApp(app.App):
         self.hexpansion_config = config
         self.foregrounded = False
 
-        self.buffersize = 1024 * 4
+        self.buffersize = 1024 * 4 # this seems baked into the esp32, can't go lower. 
 
         self.rms = 0.0 # current rms volume
         self.rmin = 1.0 # rolling minimum
         self.rmax = 10.0 # rolling maximum
         self.relative = 0.1 # relative volume
         self.window_decay = 0.99 # how quickly the rolling min and max adjust to changes in volume. Closer to 1 is slower decay, closer to 0 is faster decay
-        self.led_decay = 0.3 # high water mark decay
-        self.brightness_control = 0.5
-        self.led_levels = [0.0] * 12  # Current level for each LED
+        
+        self.brightness_control = 0.5 # global brightness modifier
+        self.led_high_levels = [0.0] * 12  # High water mark for each led
+        self.led_high_decay = 0.3 # high water mark decay
 
         self.buffer = bytearray(self.buffersize) #buffer to get the raw bitstream from the mic
 
@@ -66,7 +69,7 @@ class MicApp(app.App):
             ibuf=self.buffersize
         )
     
-                
+        #set up the menu        
         self.vismode = 0
         self.vismodes = ["RMS", "ZC", "FFT"]
         self.palette = 0   
@@ -95,6 +98,12 @@ class MicApp(app.App):
         self.sin_table = [math.sin(2 * math.pi * i / self.sample_count) for i in range(self.sample_count)]
         self.cos_table = [math.cos(2 * math.pi * i / self.sample_count) for i in range(self.sample_count)]
 
+        #beat detection prep
+        self.energy_history = [0.0] * 60 # Roughly 1-2 seconds of history
+        self.beat_sensitivity = 1.5 # Threshold: 1.3x average energy = beat
+        self.last_beat_time = 0
+        self.min_beat_interval = 300 # Minimum 300ms between beats (max ~200 BPM)
+
         #end init
     
     def get_hue(self, distance):
@@ -121,8 +130,7 @@ class MicApp(app.App):
             val = struct.unpack('<i', self.buffer[i:i+4])[0] #4 bytes gives us our 32 bit word 
             samples.append(val >> 8) #bitshift since our 32 bit word only contains 24 bits of data 
         return samples
-
-        
+     
     def audio_RMS(self):
         samples = self.sample_audio(1)
         # 2. Find the DC offset of THIS specific block
@@ -133,7 +141,9 @@ class MicApp(app.App):
         for s in samples:
             centered = s - block_avg
             sum_squares += centered * centered
-            
+
+
+        #rolling volume window    
         self.rms = math.sqrt(sum_squares / len(samples))
         if self.rms < self.rmin:
             self.rmin = self.rms
@@ -148,28 +158,18 @@ class MicApp(app.App):
         self.relative = (self.rms - self.rmin) / (self.rmax - self.rmin) if (self.rmax - self.rmin) > 0 else 0
         self.relative = self.relative**2
 
+        # map this single brightness number to 12 leds:
         total_brightness = 12.0 * self.relative
-        
+        led_brightness = [0.0] * 12
         for i in range(12):
             if total_brightness >= 1:
-                led_brightness = 1
+                led_brightness[i] = 1
                 total_brightness-=1
             else:
-                led_brightness = total_brightness
+                led_brightness[i] = total_brightness
                 total_brightness = 0
-            #print(self.led_levels[i],led_brightness)
-            self.led_levels[i] = max(self.led_levels[i],led_brightness) # set high water mark
-            
-            h = self.get_hue(i/12.0)            
-            r,g,b = hsv_to_rgb(h, 1.0, self.led_levels[i] * self.brightness_control)
-            
-            #tildagonos.leds[led] = (0,int(self.led_levels[i]*255), int(self.led_levels[i]*255)) # paint leds
-            j = (i+6)%12
-            tildagonos.leds[j+1] = (r, g, b)
-            
-            self.led_levels[i] = max(self.led_levels[i] * self.led_decay, 0) # decay high water mark
-            
-        tildagonos.leds.write()
+        #pass the led brightness to the linear led function:
+        self.paint_leds_linear(led_brightness, 6)
         
     def audio_ZC(self):
         samples = self.sample_audio(4)
@@ -215,34 +215,18 @@ class MicApp(app.App):
         fract = spawn_f - idx_a
         
         # Proportional split
-        self.led_levels[idx_a] = max(self.led_levels[idx_a], current_energy * (1.0 - fract))
-        self.led_levels[idx_b] = max(self.led_levels[idx_b], current_energy * fract)
+        led_brightness = [0.0] * 12
+        led_brightness[idx_a] = current_energy * (1.0 - fract)
+        led_brightness[idx_b] = current_energy * fract
 
         # 5. Draw the LEDs
-        for i in range(12):
-            h = self.get_hue(i/12.0)  
-            val = self.led_levels[i] * self.brightness_control
-            
-            # # Impact White-flash logic
-            sat = 1.0
-            # if hasattr(self, 'delta') and self.delta > (self.rmax * 0.2):
-            #     sat = 0.6
-            #     val = min(1.0, val + 0.2)
+        self.paint_leds_linear(led_brightness, 6)
 
-            r, g, b = hsv_to_rgb(h, sat, val)
-            j = (i+6)%12
-            tildagonos.leds[j+1] = (r, g, b)
-            
-            # 6. Decay (using your preferred 0.5 value)
-            self.led_levels[i] *= 0.75
-            if self.led_levels[i] < 0.01: self.led_levels[i] = 0
-
-        tildagonos.leds.write()
-    
     def audio_fft(self):
         samples = self.sample_audio(subsample=2) # Lower resolution for speed
         if not samples or len(samples) < self.sample_count: return
         
+        led_brightness = [0.0] * 12
         # We only analyze the first few 'k' harmonics to map to LEDs
         for i in range(self.num_bins):
             real = 0
@@ -268,26 +252,58 @@ class MicApp(app.App):
                 normalized = 0
 
             contrast_val = normalized ** 2.5
-            
-            # Update level and clamp
-            self.led_levels[i] = max(self.led_levels[i], contrast_val)
-            self.led_levels[i] = min(1.0, self.led_levels[i])
+            led_brightness[i] = contrast_val
 
-            h = self.get_hue(i/12.0)            
+        self.paint_leds_linear(led_brightness,6)
+        
+    def paint_leds_linear(self, brightnesses, start_led = 1, saturation = 1.0):                
+        if self.detect_beat():
+            saturation = 0.8
+        else:
+            saturation = 1.0
 
-            #clamp led_level
-            v = self.led_levels[i] * self.brightness_control
-            r,g,b = hsv_to_rgb(h, 1.0, v)
-            
-            j = (i + 6) % 12
+        for i in range(12):
+            h = self.get_hue(i/12.0) 
+
+            self.led_high_levels[i] = max(self.led_high_levels[i], brightnesses[i], 0.0) # set high water mark and clamp above 0
+            self.led_high_levels[i] = min(self.led_high_levels[i], 1.0) # clamp below 1
+
+            r,g,b = hsv_to_rgb(h, saturation, self.led_high_levels[i] * self.brightness_control)
+            j = (i + start_led) % 12
+   
             tildagonos.leds[j+1] = (r, g, b)
-            
-            self.led_levels[i] = max(self.led_levels[i] * self.led_decay, 0) # decay high water mark
+            self.led_high_levels[i] = max(self.led_high_levels[i] * self.led_high_decay, 0) # decay high water mark
             
         tildagonos.leds.write()
+
+    def detect_beat(self):
+        current_time = time.ticks_ms()
+
+
+        # 1. Calculate current 'instant' energy (from the existing RMS or FFT sum)
+        # Using the sum of led_levels is a great proxy for 'visual energy'
+        if self.vismode==2: #fft
+            instant_energy = self.led_high_levels[0] + self.led_high_levels[1] 
+        else:
+            instant_energy = sum(self.led_high_levels)
         
-                        
-                    
+        # 2. Calculate average energy of the history
+        avg_energy = sum(self.energy_history) / len(self.energy_history)
+        
+        # 3. The 'Comb' Comparison
+        # We check if the current energy is a 'spike' relative to the history
+        # Check threshold AND time gate
+        if instant_energy > (avg_energy * self.beat_sensitivity):
+            if time.ticks_diff(current_time, self.last_beat_time) > self.min_beat_interval:
+                self.last_beat_time = current_time
+                return True
+
+        #is_beat = instant_energy > (avg_energy * self.beat_sensitivity)
+        
+        # 4. Shift history buffer
+        self.energy_history.pop(0)
+        self.energy_history.append(instant_energy)
+        return False
 
     def update(self, delta):
         if not self.foregrounded: # Bring the app to the foreground on first run
@@ -330,11 +346,17 @@ class MicApp(app.App):
             self.notification = Notification(self.palettes[self.palette][0])
         if item == "HexyHexyMic!":
             self.notification = Notification("HexyHexyMic by @GlitchEngine@Mastodon.social")
+        if item == "Brightness":
+            level = int(self.brightness_control * 10) + 1
+            if level > 10: level = 1 # Wrap back to 10% instead of going to 0%
+            self.brightness_control = level / 10
+            self.notification = Notification("{}%".format(int(self.brightness_control * 100)))
+
 
 
     def back_handler(self):
-        self._cleanup()
         #self.i2s.deinit()
+        self._cleanup()
         self.minimise()
 
 
