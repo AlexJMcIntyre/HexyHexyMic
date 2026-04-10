@@ -8,7 +8,6 @@ from system.patterndisplay.events import PatternDisable, PatternEnable
 from system.scheduler.events import RequestForegroundPushEvent
 from tildagonos import tildagonos
 
-
 def hsv_to_rgb(h, s, v):
     h_i = int(h * 6)
     f = h * 6 - h_i
@@ -52,7 +51,7 @@ class MicApp(app.App):
         self.brightness_control = 0.5
         self.led_levels = [0.0] * 12  # Current level for each LED
 
-        self.buffer = bytearray(self.buffersize)
+        self.buffer = bytearray(self.buffersize) #buffer to get the raw bitstream from the mic
 
         # set up the microphone
         self.i2s = I2S(
@@ -87,8 +86,17 @@ class MicApp(app.App):
         )
         self.notification = None
 
-        #end init
+        # FFT prep
+        self.num_bins = 12
+        self.sample_count = 64 # Keep this small for speed!
+        self.bin_maxes = [1.0] * 12
 
+        # Precompute Sin/Cos tables for the frequencies we care about
+        self.sin_table = [math.sin(2 * math.pi * i / self.sample_count) for i in range(self.sample_count)]
+        self.cos_table = [math.cos(2 * math.pi * i / self.sample_count) for i in range(self.sample_count)]
+
+        #end init
+    
     def get_hue(self, distance):
         live_palette = self.palettes[self.palette][1]
         num_segments = len(live_palette) - 1
@@ -104,36 +112,37 @@ class MicApp(app.App):
         # Simple LERP formula: start + (end - start) * fraction
         return start_hue + (end_hue - start_hue) * fraction
     
-    def audio_RMS(self):
-        # Starting Zero-Mean Volume Meter...
+    def sample_audio(self, subsample = 1):
+        num_bytes_read = self.i2s.readinto(self.buffer) # get the raw bitstream 
+        if num_bytes_read <= 0: return
 
-        num_bytes_read = self.i2s.readinto(self.buffer)
-        if num_bytes_read > 0:
-            # 1. Convert bytes to integers first
-            samples = []
-            subsampele_factor = 8 # Process every 8th sample to reduce CPU load
-            for i in range(0, num_bytes_read, subsampele_factor):
-                val = struct.unpack('<i', self.buffer[i:i+4])[0]
-                samples.append(val >> 8) #bitshift as microphone outputs 24-bit data in a 32-bit container
+        samples = []
+        for i in range(0, num_bytes_read, subsample * 4): # subsampling allows to to cut the number of samples
+            val = struct.unpack('<i', self.buffer[i:i+4])[0] #4 bytes gives us our 32 bit word 
+            samples.append(val >> 8) #bitshift since our 32 bit word only contains 24 bits of data 
+        return samples
+
+        
+    def audio_RMS(self):
+        samples = self.sample_audio(1)
+        # 2. Find the DC offset of THIS specific block
+        block_avg = sum(samples) / len(samples)
             
-            # 2. Find the DC offset of THIS specific block
-            block_avg = sum(samples) / len(samples)
+        # 3. Calculate RMS using centered samples
+        sum_squares = 0
+        for s in samples:
+            centered = s - block_avg
+            sum_squares += centered * centered
             
-            # 3. Calculate RMS using centered samples
-            sum_squares = 0
-            for s in samples:
-                centered = s - block_avg
-                sum_squares += centered * centered
-            
-            self.rms = math.sqrt(sum_squares / len(samples))
-            if self.rms < self.rmin:
-                self.rmin = self.rms
-            else:
-                self.rmin = self.rmin / self.window_decay
-            if self.rms > self.rmax:
-                self.rmax = self.rms
-            else:
-                self.rmax = self.rmax * self.window_decay
+        self.rms = math.sqrt(sum_squares / len(samples))
+        if self.rms < self.rmin:
+            self.rmin = self.rms
+        else:
+            self.rmin = self.rmin / self.window_decay
+        if self.rms > self.rmax:
+            self.rmax = self.rms
+        else:
+            self.rmax = self.rmax * self.window_decay
 
         # Get relative position
         self.relative = (self.rms - self.rmin) / (self.rmax - self.rmin) if (self.rmax - self.rmin) > 0 else 0
@@ -155,22 +164,16 @@ class MicApp(app.App):
             r,g,b = hsv_to_rgb(h, 1.0, self.led_levels[i] * self.brightness_control)
             
             #tildagonos.leds[led] = (0,int(self.led_levels[i]*255), int(self.led_levels[i]*255)) # paint leds
-            tildagonos.leds[i+1] = (r, g, b) # paint leds
+            j = (i+6)%12
+            tildagonos.leds[j+1] = (r, g, b)
             
             self.led_levels[i] = max(self.led_levels[i] * self.led_decay, 0) # decay high water mark
             
         tildagonos.leds.write()
         
     def audio_ZC(self):
-        num_bytes_read = self.i2s.readinto(self.buffer)
-        if num_bytes_read <= 0: return
+        samples = self.sample_audio(4)
 
-        # Pass 1: Unpack and Find Average
-        samples = []
-        for i in range(0, num_bytes_read, 8): # Step by 8 but only take 4 bytes
-            val = struct.unpack('<i', self.buffer[i:i+4])[0]
-            samples.append(val >> 8)
-        
         avg = sum(samples) / len(samples)
         
         # Pass 2: Metrics
@@ -227,16 +230,64 @@ class MicApp(app.App):
             #     val = min(1.0, val + 0.2)
 
             r, g, b = hsv_to_rgb(h, sat, val)
-            tildagonos.leds[i+1] = (r, g, b)
+            j = (i+6)%12
+            tildagonos.leds[j+1] = (r, g, b)
             
             # 6. Decay (using your preferred 0.5 value)
             self.led_levels[i] *= 0.75
             if self.led_levels[i] < 0.01: self.led_levels[i] = 0
 
         tildagonos.leds.write()
-                    
-
+    
+    def audio_fft(self):
+        samples = self.sample_audio(subsample=2) # Lower resolution for speed
+        if not samples or len(samples) < self.sample_count: return
         
+        # We only analyze the first few 'k' harmonics to map to LEDs
+        for i in range(self.num_bins):
+            real = 0
+            imag = 0
+            k = i + 1 # Target frequency harmonic
+            
+            for n in range(self.sample_count):
+                # Optimized lookup index
+                idx = (k * n) % self.sample_count
+                real += samples[n] * self.cos_table[idx]
+                imag -= samples[n] * self.sin_table[idx]
+            
+            # Magnitude approximation (faster than sqrt)
+            mag = abs(real) + abs(imag)
+
+            #per-bin rolling max
+            self.bin_maxes[i] = max(mag, self.bin_maxes[i] * 0.99)
+
+            # 2. Normalize 0.0 to 1.0 based on the rolling max
+            if self.bin_maxes[i] > 0:
+                normalized = mag / self.bin_maxes[i]
+            else:
+                normalized = 0
+
+            contrast_val = normalized ** 2.5
+            
+            # Update level and clamp
+            self.led_levels[i] = max(self.led_levels[i], contrast_val)
+            self.led_levels[i] = min(1.0, self.led_levels[i])
+
+            h = self.get_hue(i/12.0)            
+
+            #clamp led_level
+            v = self.led_levels[i] * self.brightness_control
+            r,g,b = hsv_to_rgb(h, 1.0, v)
+            
+            j = (i + 6) % 12
+            tildagonos.leds[j+1] = (r, g, b)
+            
+            self.led_levels[i] = max(self.led_levels[i] * self.led_decay, 0) # decay high water mark
+            
+        tildagonos.leds.write()
+        
+                        
+                    
 
     def update(self, delta):
         if not self.foregrounded: # Bring the app to the foreground on first run
@@ -249,6 +300,8 @@ class MicApp(app.App):
             self.audio_RMS()
         elif self.vismode == 1:
             self.audio_ZC()
+        elif self.vismode == 2:
+            self.audio_fft()
         
 
         self.menu.update(delta)
@@ -276,11 +329,12 @@ class MicApp(app.App):
             self.palette = (self.palette + 1) % len(self.palettes)
             self.notification = Notification(self.palettes[self.palette][0])
         if item == "About":
-            self.notification = Notification("HexyHexyMic by @GlitchEngine@Mastodon.social`")
+            self.notification = Notification("HexyHexyMic by @GlitchEngine@Mastodon.social")
 
 
     def back_handler(self):
         self._cleanup()
+        self.i2s.deinit()
         self.minimise()
 
 
