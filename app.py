@@ -30,9 +30,9 @@ def hsv_to_rgb(h, s, v):
         return v, p, q
     
 menu_items = [
+    "HexyHexyMic!",
     "Vis Mode",
-    "Color Palette",
-    "About"]
+    "Color Palette"]
 
 class MicApp(app.App):
     def __init__(self, config=None):
@@ -328,13 +328,13 @@ class MicApp(app.App):
         if item == "Color Palette":
             self.palette = (self.palette + 1) % len(self.palettes)
             self.notification = Notification(self.palettes[self.palette][0])
-        if item == "About":
+        if item == "HexyHexyMic!":
             self.notification = Notification("HexyHexyMic by @GlitchEngine@Mastodon.social")
 
 
     def back_handler(self):
         self._cleanup()
-        self.i2s.deinit()
+        #self.i2s.deinit()
         self.minimise()
 
 
