@@ -71,9 +71,9 @@ class MicApp(app.App):
     
         #set up the menu        
         self.vismode = 0
-        self.vismodes = ["RMS", "ZC", "FFT"]
+        self.vismodes = ["RMS", "ZC", "FFT", "Vortex"]
         self.palette = 0   
-        self.palettes = [("Neon",(0.78,0.85,0.52)),
+        self.palettes = [("Neon",(0.83,0.49,0.38)),
                         ("Sunset",(0.02, 0.08, 0.16)),
                         ("Arctic",(0.61, 0.58, 0.53, 0.48)),
                         ("Flora",(0.42, 0.22, 0.15, 0.05)),
@@ -94,15 +94,20 @@ class MicApp(app.App):
         self.sample_count = 64 # Keep this small for speed!
         self.bin_maxes = [1.0] * 12
 
+        self.angle = 0
+
         # Precompute Sin/Cos tables for the frequencies we care about
         self.sin_table = [math.sin(2 * math.pi * i / self.sample_count) for i in range(self.sample_count)]
         self.cos_table = [math.cos(2 * math.pi * i / self.sample_count) for i in range(self.sample_count)]
 
         #beat detection prep
         self.energy_history = [0.0] * 60 # Roughly 1-2 seconds of history
-        self.beat_sensitivity = 1.5 # Threshold: 1.3x average energy = beat
         self.last_beat_time = 0
         self.min_beat_interval = 300 # Minimum 300ms between beats (max ~200 BPM)
+        self.last_beat_ms = time.ticks_ms()
+        self.beat_interval = 500  # Start with a 120 BPM guess
+        self.target_index = 6.0   # Adjust this (0-11) to define "bottom
+        
 
         #end init
     
@@ -200,7 +205,7 @@ class MicApp(app.App):
         # Instead of hard-clamping at 1.0, we use a softer scaling.
         # We also reduce the multiplier slightly so 'normal' high pitches 
         # land around LED 10/11, leaving 12 for truly extreme frequencies.
-        scaled_pitch = self.pitch_factor * 2.5
+        scaled_pitch = self.pitch_factor * 1.5
         if scaled_pitch > 0.98: scaled_pitch = 0.98 # Tiny buffer to prevent index overflow
         
         # Map to 0.0 - 11.0 range
@@ -223,39 +228,81 @@ class MicApp(app.App):
         self.paint_leds_linear(led_brightness, 6)
 
     def audio_fft(self):
-        samples = self.sample_audio(subsample=2) # Lower resolution for speed
-        if not samples or len(samples) < self.sample_count: return
+        samples = self.sample_audio(subsample=2)
+        if not samples or len(samples) < self.sample_count: 
+            return
         
-        led_brightness = [0.0] * 12
-        # We only analyze the first few 'k' harmonics to map to LEDs
-        for i in range(self.num_bins):
+        # --- OPTIMIZATION: Local Variable Caching ---
+        # Accessing 'self' inside a tight loop is slow in MicroPython
+        cos_t = self.cos_table
+        sin_t = self.sin_table
+        bin_m = self.bin_maxes
+        sc = self.sample_count
+        num_b = self.num_bins
+        
+        led_brightness = [0.0] * num_b
+
+        for i in range(num_b):
             real = 0
             imag = 0
-            k = i + 1 # Target frequency harmonic
+            k = i + 1 
             
-            for n in range(self.sample_count):
-                # Optimized lookup index
-                idx = (k * n) % self.sample_count
-                real += samples[n] * self.cos_table[idx]
-                imag -= samples[n] * self.sin_table[idx]
+            # Inner loop optimization: cache the lookup index increment
+            # This is where 90% of the CPU time is spent
+            for n in range(sc):
+                idx = (k * n) % sc
+                s_n = samples[n]
+                real += s_n * cos_t[idx]
+                imag -= s_n * sin_t[idx]
             
-            # Magnitude approximation (faster than sqrt)
             mag = abs(real) + abs(imag)
 
-            #per-bin rolling max
-            self.bin_maxes[i] = max(mag, self.bin_maxes[i] * 0.99)
+            # Update rolling max
+            current_max = max(mag, bin_m[i] * 0.99)
+            bin_m[i] = current_max
 
-            # 2. Normalize 0.0 to 1.0 based on the rolling max
-            if self.bin_maxes[i] > 0:
-                normalized = mag / self.bin_maxes[i]
+            # Normalization and Contrast
+            if current_max > 0:
+                # Using (mag / current_max) ** 2.5
+                led_brightness[i] = (mag / current_max) ** 2.5
             else:
-                normalized = 0
+                led_brightness[i] = 0
 
-            contrast_val = normalized ** 2.5
-            led_brightness[i] = contrast_val
+        self.paint_leds_linear(led_brightness, 6)
 
-        self.paint_leds_linear(led_brightness,6)
+    def audio_vortex(self):
+        current_time = time.ticks_ms()
+        delta_ms = time.ticks_diff(current_time, self.last_beat_ms)
         
+        if self.detect_beat():
+            self.beat_interval = max(200, delta_ms) # Clamp to avoid crazy speeds
+            self.last_beat_ms = current_time
+            self.angle = self.target_index
+        else:
+            # 2. Predictive Drift
+            rotation_progress = (12.0 / self.beat_interval) * delta_ms
+            self.angle = (self.target_index + rotation_progress) % 12
+
+        # 3. Dynamic Brightness (Volume still controls the "glow")
+        samples = self.sample_audio(subsample=4)
+        if samples:
+            avg = sum(samples) / len(samples)
+            energy = sum(abs(s - avg) for s in samples) / len(samples)
+            self.rmax = max(energy, self.rmax * 0.98)
+            rel = (energy / self.rmax) if self.rmax > 0 else 0
+            intensity = rel ** 2
+        else:
+            intensity = 0.5
+        # 4. Render
+        led_brightness = [0.0] * 12
+        center_led = int(self.angle)
+        
+        led_brightness[center_led] = intensity
+        led_brightness[(center_led - 1) % 12] = intensity * 0.5
+        led_brightness[(center_led - 2) % 12] = intensity * 0.2
+
+        self.paint_leds_linear(led_brightness, 0)
+
     def paint_leds_linear(self, brightnesses, start_led = 1, saturation = 1.0):                
         if self.detect_beat():
             saturation = 0.8
@@ -275,32 +322,27 @@ class MicApp(app.App):
             self.led_high_levels[i] = max(self.led_high_levels[i] * self.led_high_decay, 0) # decay high water mark
             
         tildagonos.leds.write()
-
+        
     def detect_beat(self):
         current_time = time.ticks_ms()
-
-
-        # 1. Calculate current 'instant' energy (from the existing RMS or FFT sum)
-        # Using the sum of led_levels is a great proxy for 'visual energy'
-        if self.vismode==2: #fft
-            instant_energy = self.led_high_levels[0] + self.led_high_levels[1] 
-        else:
-            instant_energy = sum(self.led_high_levels)
+        instant_energy = sum(self.led_high_levels)
         
-        # 2. Calculate average energy of the history
+        # Calculate Mean
         avg_energy = sum(self.energy_history) / len(self.energy_history)
         
-        # 3. The 'Comb' Comparison
-        # We check if the current energy is a 'spike' relative to the history
-        # Check threshold AND time gate
-        if instant_energy > (avg_energy * self.beat_sensitivity):
+        # Calculate Variance (how much the energy fluctuates)
+        variance = sum((x - avg_energy) ** 2 for x in self.energy_history) / len(self.energy_history)
+        std_dev = math.sqrt(variance)
+        
+        # Adaptive threshold: Sensitivity decreases as the music gets noisier
+        # 1.0 is a base multiplier, adjusted by the variance
+        dynamic_sensitivity = 1.0 + (std_dev / (avg_energy + 0.001)) 
+        
+        if instant_energy > (avg_energy * dynamic_sensitivity):
             if time.ticks_diff(current_time, self.last_beat_time) > self.min_beat_interval:
                 self.last_beat_time = current_time
                 return True
 
-        #is_beat = instant_energy > (avg_energy * self.beat_sensitivity)
-        
-        # 4. Shift history buffer
         self.energy_history.pop(0)
         self.energy_history.append(instant_energy)
         return False
@@ -309,23 +351,23 @@ class MicApp(app.App):
         if not self.foregrounded: # Bring the app to the foreground on first run
             eventbus.emit(RequestForegroundPushEvent(self))
             self.foregrounded = True
-            
-        """Update LEDs with gradual lighting and trailing effect."""
 
-        if self.vismode == 0:
-            self.audio_RMS()
-        elif self.vismode == 1:
-            self.audio_ZC()
-        elif self.vismode == 2:
-            self.audio_fft()
-        
+        start_time = time.ticks_ms()
+        budget_ms = 40 
+            
+        while time.ticks_diff(time.ticks_ms(), start_time) < budget_ms:
+            if self.vismode == 0:
+                self.audio_RMS()
+            elif self.vismode == 1:
+                self.audio_ZC()
+            elif self.vismode == 2:
+                self.audio_fft()
+            elif self.vismode == 3:
+                self.audio_vortex()
 
         self.menu.update(delta)
         if self.notification:
             self.notification.update(delta)
-            
-
-        
 
     def draw(self, ctx):
         """Clear screen each frame."""
@@ -334,8 +376,6 @@ class MicApp(app.App):
         if self.notification:
             self.notification.draw(ctx)
         return None
-
-
 
     def select_handler(self, item, idx):
         if item == "Vis Mode":
@@ -352,20 +392,14 @@ class MicApp(app.App):
             self.brightness_control = level / 10
             self.notification = Notification("{}%".format(int(self.brightness_control * 100)))
 
-
-
     def back_handler(self):
         #self.i2s.deinit()
         self._cleanup()
         self.minimise()
 
-
-
-
     def _cleanup(self):
         #eventbus.remove(ButtonDownEvent, self._handle_buttondown, self.app)
         eventbus.emit(PatternEnable()) # disable the ambient pattern. We're going to need those LEDs!
-
 
 
 __app_export__ = MicApp
