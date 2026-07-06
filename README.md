@@ -1,4 +1,4 @@
-![HexyHexyMic in action](images/LEDs.gif)
+![HexyHexyMic in action](images/LEDs.jpeg)
 
 # HexyHexyMic
 
