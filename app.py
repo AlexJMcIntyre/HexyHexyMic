@@ -34,7 +34,9 @@ menu_items = [
     "HexyHexyMic!",
     "Vis Mode",
     "Color Palette",
-    "Brightness"]
+    "Beat Flash",
+    "Brightness"
+]
 
 class MicApp(app.App):
     def __init__(self, config=None):
@@ -73,12 +75,13 @@ class MicApp(app.App):
         self.vismode = 0
         self.vismodes = ["RMS", "ZC", "FFT", "Vortex"]
         self.palette = 0   
-        self.palettes = [("Neon",(0.83,0.49,0.38)),
-                        ("Sunset",(0.02, 0.08, 0.16)),
-                        ("Arctic",(0.61, 0.58, 0.53, 0.48)),
-                        ("Flora",(0.42, 0.22, 0.15, 0.05)),
-                        ("Berry", (0.95,0.88, 0.82, 0.75)),
-                        ("Pride", (0.0, 0.08, 0.16, 0.33, 0.66, 0.81))
+        self.palettes = [("Neon",(0.78,0.49,0.33)),
+                        ("Ember",(0.02, 0.05, 0.09, 0.14)),
+                        ("Deep",(0.70, 0.63, 0.56, 0.50)),
+                        ("Flora",(0.42, 0.22, 0.15, 1.00)),
+                        ("Berry", (0.95,0.88, 0.82, 0.6)),
+                        ("Rainbow", (0.0, 0.08, 0.16, 0.33, 0.66, 0.81)),
+                        ("Aurora", (0.27, 0.38, 0.49, 0.62))
                         ]
         
         self.menu = Menu(
@@ -103,12 +106,13 @@ class MicApp(app.App):
         #beat detection prep
         self.energy_history = [0.0] * 60 # Roughly 1-2 seconds of history
         self.last_beat_time = 0
-        self.min_beat_interval = 300 # Minimum 300ms between beats (max ~200 BPM)
+        self.min_beat_interval = 200 # Minimum 300ms between beats (max ~200 BPM)
         self.last_beat_ms = time.ticks_ms()
         self.beat_interval = 500  # Start with a 120 BPM guess
         self.target_index = 6.0   # Adjust this (0-11) to define "bottom
+        self.beat = False
+        self.beat_flash = False
         
-
         #end init
     
     def get_hue(self, distance):
@@ -140,15 +144,12 @@ class MicApp(app.App):
         samples = self.sample_audio(1)
         # 2. Find the DC offset of THIS specific block
         block_avg = sum(samples) / len(samples)
-            
-        # 3. Calculate RMS using centered samples
+
         sum_squares = 0
         for s in samples:
             centered = s - block_avg
             sum_squares += centered * centered
 
-
-        #rolling volume window    
         self.rms = math.sqrt(sum_squares / len(samples))
         if self.rms < self.rmin:
             self.rmin = self.rms
@@ -163,7 +164,6 @@ class MicApp(app.App):
         self.relative = (self.rms - self.rmin) / (self.rmax - self.rmin) if (self.rmax - self.rmin) > 0 else 0
         self.relative = self.relative**2
 
-        # map this single brightness number to 12 leds:
         total_brightness = 12.0 * self.relative
         led_brightness = [0.0] * 12
         for i in range(12):
@@ -201,10 +201,6 @@ class MicApp(app.App):
         self.rmax = max(self.rms, self.rmax * 0.98)
         self.relative = (self.rms - self.rmin) / (self.rmax - self.rmin) if (self.rmax - self.rmin) > 0 else 0
        
-        # 2. Balanced Pitch Mapping
-        # Instead of hard-clamping at 1.0, we use a softer scaling.
-        # We also reduce the multiplier slightly so 'normal' high pitches 
-        # land around LED 10/11, leaving 12 for truly extreme frequencies.
         scaled_pitch = self.pitch_factor * 1.5
         if scaled_pitch > 0.98: scaled_pitch = 0.98 # Tiny buffer to prevent index overflow
         
@@ -231,9 +227,7 @@ class MicApp(app.App):
         samples = self.sample_audio(subsample=2)
         if not samples or len(samples) < self.sample_count: 
             return
-        
-        # --- OPTIMIZATION: Local Variable Caching ---
-        # Accessing 'self' inside a tight loop is slow in MicroPython
+
         cos_t = self.cos_table
         sin_t = self.sin_table
         bin_m = self.bin_maxes
@@ -246,9 +240,7 @@ class MicApp(app.App):
             real = 0
             imag = 0
             k = i + 1 
-            
-            # Inner loop optimization: cache the lookup index increment
-            # This is where 90% of the CPU time is spent
+
             for n in range(sc):
                 idx = (k * n) % sc
                 s_n = samples[n]
@@ -261,9 +253,7 @@ class MicApp(app.App):
             current_max = max(mag, bin_m[i] * 0.99)
             bin_m[i] = current_max
 
-            # Normalization and Contrast
             if current_max > 0:
-                # Using (mag / current_max) ** 2.5
                 led_brightness[i] = (mag / current_max) ** 2.5
             else:
                 led_brightness[i] = 0
@@ -274,8 +264,8 @@ class MicApp(app.App):
         current_time = time.ticks_ms()
         delta_ms = time.ticks_diff(current_time, self.last_beat_ms)
         
-        if self.detect_beat():
-            self.beat_interval = max(200, delta_ms) # Clamp to avoid crazy speeds
+        if self.beat:
+            self.beat_interval = max(200, delta_ms)
             self.last_beat_ms = current_time
             self.angle = self.target_index
         else:
@@ -283,7 +273,6 @@ class MicApp(app.App):
             rotation_progress = (12.0 / self.beat_interval) * delta_ms
             self.angle = (self.target_index + rotation_progress) % 12
 
-        # 3. Dynamic Brightness (Volume still controls the "glow")
         samples = self.sample_audio(subsample=4)
         if samples:
             avg = sum(samples) / len(samples)
@@ -293,7 +282,6 @@ class MicApp(app.App):
             intensity = rel ** 2
         else:
             intensity = 0.5
-        # 4. Render
         led_brightness = [0.0] * 12
         center_led = int(self.angle)
         
@@ -304,8 +292,8 @@ class MicApp(app.App):
         self.paint_leds_linear(led_brightness, 0)
 
     def paint_leds_linear(self, brightnesses, start_led = 1, saturation = 1.0):                
-        if self.detect_beat():
-            saturation = 0.8
+        if self.beat and self.beat_flash:
+            saturation = 0.5
         else:
             saturation = 1.0
 
@@ -326,16 +314,12 @@ class MicApp(app.App):
     def detect_beat(self):
         current_time = time.ticks_ms()
         instant_energy = sum(self.led_high_levels)
-        
-        # Calculate Mean
+
         avg_energy = sum(self.energy_history) / len(self.energy_history)
-        
-        # Calculate Variance (how much the energy fluctuates)
+
         variance = sum((x - avg_energy) ** 2 for x in self.energy_history) / len(self.energy_history)
         std_dev = math.sqrt(variance)
-        
-        # Adaptive threshold: Sensitivity decreases as the music gets noisier
-        # 1.0 is a base multiplier, adjusted by the variance
+
         dynamic_sensitivity = 1.0 + (std_dev / (avg_energy + 0.001)) 
         
         if instant_energy > (avg_energy * dynamic_sensitivity):
@@ -364,6 +348,7 @@ class MicApp(app.App):
                 self.audio_fft()
             elif self.vismode == 3:
                 self.audio_vortex()
+            self.beat = self.detect_beat()
 
         self.menu.update(delta)
         if self.notification:
@@ -385,22 +370,22 @@ class MicApp(app.App):
             self.palette = (self.palette + 1) % len(self.palettes)
             self.notification = Notification(self.palettes[self.palette][0])
         if item == "HexyHexyMic!":
-            self.notification = Notification("HexyHexyMic by @GlitchEngine@Mastodon.social")
+            self.notification = Notification("github.com/AlexJMcIntyre/HexyHexyMic")
         if item == "Brightness":
             level = int(self.brightness_control * 10) + 1
             if level > 10: level = 1 # Wrap back to 10% instead of going to 0%
             self.brightness_control = level / 10
             self.notification = Notification("{}%".format(int(self.brightness_control * 100)))
+        if item == "Beat Flash":
+            self.beat_flash = not self.beat_flash
+            self.notification = Notification("On" if self.beat_flash else "Off")
 
     def back_handler(self):
-        #self.i2s.deinit()
         self._cleanup()
         self.minimise()
 
     def _cleanup(self):
-        #eventbus.remove(ButtonDownEvent, self._handle_buttondown, self.app)
         eventbus.emit(PatternEnable()) # disable the ambient pattern. We're going to need those LEDs!
 
 
 __app_export__ = MicApp
-
