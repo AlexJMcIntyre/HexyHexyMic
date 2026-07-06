@@ -1,4 +1,4 @@
-![HexyHexyMic in action](https://github.com/AlexJMcIntyre/HexyHexyMic/images/LEDs.gif)
+![HexyHexyMic in action](images/LEDs.gif)
 
 # HexyHexyMic
 
