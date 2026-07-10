@@ -14,6 +14,7 @@ The entire application is written in MicroPython and is baked into the EEPROM on
 
 If you enjoyed this project or picked up a HexyMic at EMF2026, donations towards parts and future projects are appreciated, but never expected:
 https://ko-fi.com/AlexJMcIntyre
+
 https://paypal.me/AlexJMcIntyre
 
 ----------
