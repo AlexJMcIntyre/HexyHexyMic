@@ -13,6 +13,7 @@ This was my first attempt at building a Tildagon Hexpansion, and also my first s
 The entire application is written in MicroPython and is baked into the EEPROM on the Hexpansion.
 
 If you enjoyed this project or picked up a HexyMic at EMF2026, donations towards parts and future projects are appreciated, but never expected:
+
 https://ko-fi.com/AlexJMcIntyre
 
 https://paypal.me/AlexJMcIntyre
